@@ -3,12 +3,14 @@ title: "Portfolio Optimisation and Risk Analysis: John and Mary Davis"
 author: "Jian Heng Koo"
 date: "May 2026"
 output:
+  pdf_document:
+    toc: true
   html_document:
     toc: true
+    toc_float: true
+    code_folding: hide
     df_print: paged
   word_document:
-    toc: true
-  pdf_document:
     toc: true
 ---
 
