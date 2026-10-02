@@ -1,5 +1,5 @@
 ---
-title: "Portfolio Optimisation and Risk Analysis"
+title: "Portfolio Optimisation and Risk Analysis: John and Mary Davis"
 author: "Jian Heng Koo"
 date: "May 2026"
 output:
@@ -15,18 +15,19 @@ output:
 # Case Study Scenario
 
 This project considers a hypothetical investment-planning scenario involving
-two recently retired investors with a combined portfolio of $1.5 million.
+John and Mary Davis, a recently retired couple with a combined portfolio of
+$1.5 million.
 
-The investors have different attitudes towards risk. One prioritises capital
-preservation and seeks to minimise portfolio volatility, while the other is
-willing to accept greater risk in pursuit of stronger long-term growth.
+John prioritises capital preservation and seeks to minimise portfolio
+volatility. Mary is willing to accept greater risk in pursuit of stronger
+long-term growth.
 
-The objective is to translate these competing preferences into quantitative
+The objective is to translate their competing preferences into quantitative
 portfolio strategies, construct suitable portfolios using historical equity
 data, and evaluate their performance using an out-of-sample validation period.
 
 A final blended portfolio is then constructed to provide a practical compromise
-between the two investment objectives.
+between John and Mary's investment objectives.
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(
