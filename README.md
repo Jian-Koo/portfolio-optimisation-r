@@ -50,13 +50,7 @@ John's portfolio prioritises capital preservation and is constructed by minimisi
 
 Mary's portfolio uses a mean-variance objective that places greater emphasis on expected return while retaining a penalty for portfolio risk.
 
-A risk-aversion coefficient of:
-
-\[
-\alpha = 0.25
-\]
-
-is used for the growth-oriented strategy.
+A risk-aversion coefficient of **α = 0.25** is used for the growth-oriented strategy.
 
 ### Blended Portfolio
 
@@ -101,4 +95,4 @@ portfolio-optimisation-r/
 │   └── portfolio_analysis.Rmd
 └── reports/
     ├── investment_strategy_report.pdf
-    └── portfolio_analysis.html
+    └── portfolio_analysis.pdf
