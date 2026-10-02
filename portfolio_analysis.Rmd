@@ -1,0 +1,845 @@
+---
+title: "Portfolio Optimisation and Risk Analysis"
+author: "Jian Heng Koo"
+date: "May 2026"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  word_document:
+    toc: true
+  pdf_document:
+    toc: true
+---
+
+# Case Study Scenario
+
+This project considers a hypothetical investment-planning scenario involving
+two recently retired investors with a combined portfolio of $1.5 million.
+
+The investors have different attitudes towards risk. One prioritises capital
+preservation and seeks to minimise portfolio volatility, while the other is
+willing to accept greater risk in pursuit of stronger long-term growth.
+
+The objective is to translate these competing preferences into quantitative
+portfolio strategies, construct suitable portfolios using historical equity
+data, and evaluate their performance using an out-of-sample validation period.
+
+A final blended portfolio is then constructed to provide a practical compromise
+between the two investment objectives.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+required_packages <- c(
+  "tidyquant", "tidyverse", "knitr", "ggplot2",
+  "quadprog", "scales", "lubridate", "flextable"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+pct <- function(x, accuracy = 0.01) {
+  scales::percent(x, accuracy = accuracy)
+}
+
+fmt_num <- function(x, digits = 4) {
+  format(round(x, digits), nsmall = digits)
+}
+
+fmt_dollar <- function(x) {
+  paste0("$", trimws(format(round(x, 0), big.mark = ",", scientific = FALSE)))
+}
+
+nice_table <- function(data, caption = NULL, font_size = 8) {
+  if (knitr::is_latex_output()) {
+    return(knitr::kable(data, caption = caption))
+  }
+
+  out <- flextable::flextable(data) %>%
+    flextable::theme_booktabs() %>%
+    flextable::font(fontname = "Arial", part = "all") %>%
+    flextable::fontsize(size = font_size, part = "all") %>%
+    flextable::padding(padding = 2, part = "all") %>%
+    flextable::align(align = "center", part = "all") %>%
+    flextable::align(j = 1, align = "left", part = "all") %>%
+    flextable::autofit() %>%
+    flextable::fit_to_width(max_width = 6.5) %>%
+    flextable::paginate(init = TRUE, hdr_ftr = TRUE)
+
+  if (!is.null(caption)) {
+    out <- flextable::set_caption(out, caption = caption)
+  }
+
+  out
+}
+
+```
+
+\newpage
+
+# 1. Data Preparation
+
+## 1.1 Stock Selection and Data Retrieval
+
+The analysis considers 10 stocks: AMT, AXP, BRK-B, C, ELA, EOG, MA, MS, NFLX, and REGN. Monthly adjusted closing prices are downloaded with `tidyquant`. The analysis window is January 2015 to December 2025, giving 11 calendar years. Data are downloaded from December 2014 only so that the January 2015 return can be calculated from the previous monthly adjusted close.
+
+```{r define-inputs}
+stocks <- c("AMT", "AXP", "BRK-B", "C", "ELA", "EOG", "MA", "MS", "NFLX", "REGN")
+
+download_start <- as.Date("2014-12-01")
+analysis_start <- as.Date("2015-01-01")
+estimation_end <- as.Date("2024-12-31")
+validation_start <- as.Date("2025-01-01")
+analysis_end <- as.Date("2025-12-31")
+client_portfolio_value <- 1500000
+
+estimation_label <- "January 2015 to December 2024"
+validation_label <- "January 2025 to December 2025"
+```
+
+```{r download-data}
+raw_prices <- tq_get(
+  stocks,
+  get = "stock.prices",
+  from = download_start,
+  to = analysis_end
+)
+
+if (nrow(raw_prices) == 0) {
+  stop("No stock prices were downloaded. Check the internet connection and ticker symbols.")
+}
+
+missing_tickers <- setdiff(stocks, unique(raw_prices$symbol))
+if (length(missing_tickers) > 0) {
+  stop(paste("The following tickers were not downloaded:", paste(missing_tickers, collapse = ", ")))
+}
+
+daily_data_log <- raw_prices %>%
+  group_by(symbol) %>%
+  summarise(
+    first_daily_date = min(date),
+    last_daily_date = max(date),
+    daily_observations = n(),
+    missing_adjusted_prices = sum(is.na(adjusted)),
+    .groups = "drop"
+  )
+
+nice_table(
+  daily_data_log %>%
+    transmute(
+      Stock = symbol,
+      `First daily date` = first_daily_date,
+      `Last daily date` = last_daily_date,
+      `Daily observations` = daily_observations,
+      `Missing adjusted prices` = missing_adjusted_prices
+    ),
+  caption = "Daily adjusted-price download check for the 10 assigned stocks"
+)
+```
+
+## 1.2 Monthly Prices, Returns, and Cleaning
+
+Monthly adjusted closing prices are converted to simple monthly returns using
+
+\[
+r_t = \frac{p_t - p_{t-1}}{p_{t-1}}.
+\]
+
+The analysis keeps only months in which all 10 stocks have an observed monthly return. This complete-case step keeps the return matrix aligned across assets, which is essential for correlations, covariance matrices, and portfolio optimisation.
+
+```{r monthly-returns}
+monthly_prices <- raw_prices %>%
+  group_by(symbol) %>%
+  tq_transmute(
+    select = adjusted,
+    mutate_fun = to.monthly,
+    indexAt = "lastof",
+    col_rename = "monthly_price"
+  ) %>%
+  ungroup()
+
+monthly_returns <- monthly_prices %>%
+  group_by(symbol) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(monthly_return = monthly_price / lag(monthly_price) - 1) %>%
+  ungroup() %>%
+  filter(date >= analysis_start, date <= analysis_end)
+
+monthly_data_log <- monthly_returns %>%
+  group_by(symbol) %>%
+  summarise(
+    first_return_month = min(date[!is.na(monthly_return)]),
+    last_return_month = max(date[!is.na(monthly_return)]),
+    monthly_return_observations = sum(!is.na(monthly_return)),
+    missing_monthly_returns = sum(is.na(monthly_return)),
+    .groups = "drop"
+  )
+
+return_wide_raw <- monthly_returns %>%
+  select(date, symbol, monthly_return) %>%
+  pivot_wider(names_from = symbol, values_from = monthly_return) %>%
+  arrange(date)
+
+return_wide <- return_wide_raw %>%
+  filter(if_all(all_of(stocks), ~ !is.na(.x)))
+
+dropped_months <- setdiff(return_wide_raw$date, return_wide$date)
+
+returns_est <- return_wide %>%
+  filter(date <= estimation_end)
+
+returns_val <- return_wide %>%
+  filter(date >= validation_start, date <= analysis_end)
+
+nice_table(
+  monthly_data_log %>%
+    transmute(
+      Stock = symbol,
+      `First return month` = first_return_month,
+      `Last return month` = last_return_month,
+      `Monthly return observations` = monthly_return_observations,
+      `Missing monthly returns` = missing_monthly_returns
+    ),
+  caption = "Monthly return cleaning log"
+)
+```
+
+After cleaning, the return matrix contains `r nrow(return_wide)` aligned monthly observations from `r min(return_wide$date)` to `r max(return_wide$date)`. The first 10 years, `r estimation_label`, contain `r nrow(returns_est)` monthly returns and are used for estimation and portfolio construction. The 11th year, `r validation_label`, contains `r nrow(returns_val)` monthly returns and is held out for validation. The number of dropped months due to incomplete aligned returns is `r length(dropped_months)`.
+
+# 2. Descriptive Analysis
+
+## 2.1 Returns, Volatility, and Ranking Criterion
+
+The descriptive analysis uses the estimation period only. This avoids using the 2025 validation year when ranking assets and constructing portfolios. The selected ranking criterion is the simplified Sharpe ratio used in this analysis:
+
+\[
+\text{Sharpe ratio} = \frac{\text{average monthly return}}{\text{monthly standard deviation}}.
+\]
+
+This criterion is appropriate because it rewards higher average return while penalising volatility.
+
+```{r stock-moments}
+stock_moments <- returns_est %>%
+  pivot_longer(-date, names_to = "symbol", values_to = "monthly_return") %>%
+  group_by(symbol) %>%
+  summarise(
+    n = n(),
+    mean_return = mean(monthly_return),
+    variance = var(monthly_return),
+    sd_return = sd(monthly_return),
+    ann_return = mean_return * 12,
+    ann_volatility = sd_return * sqrt(12),
+    sharpe_ratio = mean_return / sd_return,
+    t_crit = qt(0.975, df = n - 1),
+    ci_lower = mean_return - t_crit * sd_return / sqrt(n),
+    ci_upper = mean_return + t_crit * sd_return / sqrt(n),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(sharpe_ratio))
+
+moment_table <- stock_moments %>%
+  transmute(
+    Stock = symbol,
+    `Mean monthly return` = pct(mean_return),
+    Variance = fmt_num(variance, 5),
+    `Monthly standard deviation` = pct(sd_return),
+    `Annualised return` = pct(ann_return),
+    `Annualised volatility` = pct(ann_volatility),
+    `Simplified Sharpe ratio` = round(sharpe_ratio, 3),
+    `95% CI lower` = pct(ci_lower),
+    `95% CI upper` = pct(ci_upper)
+  )
+
+nice_table(
+  moment_table %>%
+    transmute(
+      Stock,
+      `Mean monthly return`,
+      Variance,
+      `Monthly SD` = `Monthly standard deviation`,
+      `Annualised return`,
+      `Annualised volatility`,
+      Sharpe = `Simplified Sharpe ratio`,
+      `95% CI lower`,
+      `95% CI upper`
+    ),
+  caption = "Estimated return, variance, volatility, Sharpe ratio, and 95% confidence interval by stock"
+)
+```
+
+```{r risk-return-plot, fig.cap="Risk-return relationship for the 10 assigned stocks during the estimation period"}
+ggplot(stock_moments, aes(x = ann_volatility, y = ann_return, label = symbol)) +
+  geom_point(aes(color = sharpe_ratio), size = 3) +
+  geom_text(vjust = -0.7, size = 3, check_overlap = TRUE) +
+  geom_hline(yintercept = mean(stock_moments$ann_return), linetype = "dashed", alpha = 0.5) +
+  geom_vline(xintercept = mean(stock_moments$ann_volatility), linetype = "dashed", alpha = 0.5) +
+  scale_x_continuous(labels = scales::label_percent(accuracy = 1)) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 1)) +
+  scale_color_gradient(low = "#B2182B", high = "#2166AC") +
+  labs(
+    title = "Risk-return trade-off",
+    subtitle = estimation_label,
+    x = "Annualised volatility",
+    y = "Annualised average return",
+    color = "Sharpe"
+  ) +
+  theme_minimal()
+```
+
+The scatter plot makes the trade-off concrete. MA stands out by combining a return well above the cross-sectional average with volatility near the lowest in the sample, which is why it ranks first. ELA sits in the high-return, high-volatility corner but does not compensate well enough for that risk, so it drops out of the top five. For John, the lower-left region of the plot — low volatility, moderate return — is most relevant. For Mary, stocks in the upper half of the return axis are preferred, as long as the volatility does not become extreme. 
+
+```{r ranking}
+ranking_table <- stock_moments %>%
+  mutate(Rank = row_number()) %>%
+  select(Rank, symbol, sharpe_ratio, mean_return, sd_return, ann_return, ann_volatility)
+
+favored_stocks <- ranking_table %>%
+  slice_head(n = 5) %>%
+  pull(symbol)
+
+nice_table(
+  ranking_table %>%
+    transmute(
+      Rank,
+      Stock = symbol,
+      `Simplified Sharpe ratio` = round(sharpe_ratio, 3),
+      `Mean monthly return` = pct(mean_return),
+      `Monthly standard deviation` = pct(sd_return),
+      `Annualised return` = pct(ann_return),
+      `Annualised volatility` = pct(ann_volatility)
+    ),
+  caption = "Ranking of the 10 assigned stocks by simplified Sharpe ratio"
+)
+```
+
+```{r ranking-plot, fig.cap="Ranking of the assigned stocks by simplified Sharpe ratio"}
+ggplot(ranking_table, aes(x = reorder(symbol, sharpe_ratio), y = sharpe_ratio)) +
+  geom_col(fill = "#2166AC") +
+  coord_flip() +
+  labs(
+    title = "Stock ranking by simplified Sharpe ratio",
+    x = "Stock",
+    y = "Average monthly return / monthly SD"
+  ) +
+  theme_minimal()
+```
+
+Using this criterion, the five favoured stocks selected for further portfolio analysis are `r paste(favored_stocks, collapse = ", ")`.
+
+## 2.2 Dependence Across Stocks
+
+Dependence is measured using the correlation matrix of monthly returns in the estimation period. Positive correlations reduce diversification benefits because assets tend to move in the same direction. Lower correlations are more useful for combining assets, because they allow losses in one stock to be partly offset by gains or smaller losses in another. 
+
+```{r correlation-analysis}
+return_matrix_10 <- returns_est %>%
+  select(all_of(stocks)) %>%
+  as.matrix()
+
+cor_matrix <- cor(return_matrix_10, use = "complete.obs")
+
+cor_pairs_index <- which(upper.tri(cor_matrix), arr.ind = TRUE)
+cor_pairs <- tibble(
+  Stock_1 = rownames(cor_matrix)[cor_pairs_index[, 1]],
+  Stock_2 = colnames(cor_matrix)[cor_pairs_index[, 2]],
+  Correlation = cor_matrix[cor_pairs_index]
+) %>%
+  arrange(desc(Correlation))
+
+average_correlation <- mean(cor_pairs$Correlation)
+highest_correlation <- cor_pairs %>% slice_max(Correlation, n = 1)
+lowest_correlation <- cor_pairs %>% slice_min(Correlation, n = 1)
+
+nice_table(
+  bind_rows(
+    highest_correlation %>% mutate(Type = "Highest pairwise correlation"),
+    lowest_correlation %>% mutate(Type = "Lowest pairwise correlation")
+  ) %>%
+    select(Type, Stock_1, Stock_2, Correlation) %>%
+    mutate(Correlation = round(Correlation, 3)) %>%
+    rename(`First stock` = Stock_1, `Second stock` = Stock_2),
+  caption = "Most and least correlated stock pairs in the estimation period"
+)
+```
+
+```{r correlation-heatmap, fig.cap="Correlation heatmap for monthly returns in the estimation period"}
+cor_heatmap_df <- as.data.frame(as.table(cor_matrix)) %>%
+  rename(Stock_1 = Var1, Stock_2 = Var2, Correlation = Freq)
+
+ggplot(cor_heatmap_df, aes(x = Stock_2, y = Stock_1, fill = Correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Correlation, 2)), size = 3) +
+  scale_fill_gradient2(
+    low = "#B2182B",
+    mid = "white",
+    high = "#2166AC",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  labs(
+    title = "Monthly return correlation matrix",
+    subtitle = paste("Average pairwise correlation:", round(average_correlation, 3)),
+    x = NULL,
+    y = NULL,
+    fill = "Correlation"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The average pairwise correlation is `r round(average_correlation, 3)`. The highest observed pairwise correlation is between `r highest_correlation$Stock_1` and `r highest_correlation$Stock_2` at `r round(highest_correlation$Correlation, 3)`, while the lowest is between `r lowest_correlation$Stock_1` and `r lowest_correlation$Stock_2` at `r round(lowest_correlation$Correlation, 3)`. This confirms the stocks move together to some degree, but not uniformly. The C–MS pair at 0.843 offers almost no diversification benefit when held together. ELA at −0.152 with REGN is the opposite extreme. For the selected five stocks, the imperfect correlations are what allow the equal-weighted portfolio to cut monthly volatility from 7.95% to 5.95% without sacrificing average return. 
+
+## 2.3 Top-5 Selection and Diversification Evidence
+
+The five favoured stocks are combined into an equal-weighted portfolio to illustrate diversification. The individual stock histograms are compared with the equal-weighted portfolio histogram. If diversification is working, the portfolio return distribution should usually be narrower than the average individual distribution.
+
+```{r diversification-data}
+selected_returns_est <- returns_est %>%
+  select(date, all_of(favored_stocks))
+
+selected_return_matrix <- selected_returns_est %>%
+  select(all_of(favored_stocks)) %>%
+  as.matrix()
+
+equal_weight_top5 <- rep(1 / length(favored_stocks), length(favored_stocks))
+names(equal_weight_top5) <- favored_stocks
+
+top5_equal_weight_returns <- as.numeric(selected_return_matrix %*% equal_weight_top5)
+
+diversification_df <- bind_rows(
+  selected_returns_est %>%
+    pivot_longer(-date, names_to = "Asset", values_to = "Return") %>%
+    mutate(Group = "Individual stock"),
+  tibble(
+    date = selected_returns_est$date,
+    Asset = "Equal-weighted top-5 portfolio",
+    Return = top5_equal_weight_returns,
+    Group = "Diversified portfolio"
+  )
+)
+
+diversification_stats <- diversification_df %>%
+  group_by(Asset, Group) %>%
+  summarise(
+    mean_return = mean(Return),
+    sd_return = sd(Return),
+    variance = var(Return),
+    .groups = "drop"
+  ) %>%
+  arrange(Group, Asset)
+
+top5_average_individual_sd <- diversification_stats %>%
+  filter(Group == "Individual stock") %>%
+  summarise(value = mean(sd_return)) %>%
+  pull(value)
+
+top5_portfolio_sd <- diversification_stats %>%
+  filter(Group == "Diversified portfolio") %>%
+  pull(sd_return)
+
+nice_table(
+  diversification_stats %>%
+    transmute(
+      Asset,
+      Group,
+      `Mean monthly return` = pct(mean_return),
+      `Monthly standard deviation` = pct(sd_return),
+      Variance = fmt_num(variance, 5)
+    ),
+  caption = "Individual versus diversified top-5 return risk"
+)
+```
+
+```{r diversification-histograms, fig.cap="Histograms of individual top-5 stock returns and the equal-weighted top-5 portfolio"}
+ggplot(diversification_df, aes(x = Return)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 25, fill = "grey80", color = "white") +
+  geom_density(color = "#2166AC", linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(~ Asset, ncol = 2) +
+  scale_x_continuous(labels = scales::label_percent(accuracy = 1)) +
+  labs(
+    title = "Return distributions for the selected stocks and equal-weighted top-5 portfolio",
+    x = "Monthly return",
+    y = "Density"
+  ) +
+  theme_minimal()
+```
+
+The equal-weighted top-5 portfolio has a monthly standard deviation of `r pct(top5_portfolio_sd)`, compared with an average individual monthly standard deviation of `r pct(top5_average_individual_sd)` across the selected stocks. This supports the diversification principle: combining imperfectly correlated stocks reduces the volatility of total portfolio returns.
+
+# 3. Portfolio Construction
+
+## 3.1 Expected Return, Variance, and Confidence Intervals
+
+Expected returns and variances are estimated from the first 10 years of monthly returns. The expected return estimate is the sample mean, and the variance estimate is the sample variance. A 95% confidence interval for each stock's expected monthly return is calculated as
+
+\[
+\bar{r} \pm t_{0.975,n-1}\frac{s}{\sqrt{n}},
+\]
+
+where \(\bar{r}\) is the sample mean monthly return, \(s\) is the sample standard deviation, and \(n\) is the number of monthly observations.
+
+```{r expected-return-table}
+nice_table(
+  moment_table %>%
+    select(
+      Stock,
+      `Mean monthly return`,
+      `Variance`,
+      `Monthly standard deviation`,
+      `95% CI lower`,
+      `95% CI upper`
+    ),
+  caption = "Expected monthly return, variance, and 95% confidence interval by stock"
+)
+```
+
+The confidence intervals are quite wide which means the estimated average returns are uncertain. Monthly stock returns can vary a lot, so the sample mean should be treated as an estimate rather than an exact prediction of future returns. 
+
+## 3.2 Portfolio Objectives
+
+Two portfolio objectives are used because John and Mary have different investment preferences. John's objective focuses on capital preservation, so his portfolio is constructed by minimising portfolio variance:
+
+\[
+\min_w \quad w'\Sigma w.
+\]
+
+This is also consistent with the mean-variance framework used in the analysis. In the mean-variance objective, as \(\alpha\) becomes very large, the risk penalty dominates the expected-return term, so the solution converges to the minimum-variance portfolio. Therefore, John's portfolio can be interpreted as the extreme risk-averse case of the mean-variance model.
+
+This objective is appropriate for John because it directly targets the lowest possible volatility among the selected stocks, subject to the portfolio constraints. It does not chase higher expected return if doing so would increase risk.
+
+Mary's objective is a growth-oriented mean-variance objective:
+
+\[
+\max_w \quad w'\mu - \alpha w'\Sigma w,
+\]
+
+where \(w\) is the portfolio weight vector, \(\mu\) is the vector of expected returns, \(\Sigma\) is the covariance matrix of returns, and \(\alpha\) is the risk-aversion parameter. For Mary, I use \(\alpha = 0.25\). This gives more influence to expected return while still applying a penalty for risk, which reflects her willingness to accept some additional volatility for higher expected growth.
+
+Both portfolios use only the five favoured stocks, use the first 10 years of data, require the weights to add to 100%, do not allow short selling, and limit each stock to a maximum weight of 40% to avoid excessive concentration:
+
+\[
+\sum_i w_i = 1,\quad 0 \leq w_i \leq 0.40.
+\]
+
+## 3.3 Constrained Portfolio Optimisation
+
+The optimisation uses annualised expected returns and annualised covariance matrices, both estimated from monthly returns in the first 10 years. `quadprog::solve.QP()` solves the constrained quadratic programs.
+
+```{r portfolio-optimisation}
+selected_assets <- favored_stocks
+
+mu_monthly <- stock_moments %>%
+  filter(symbol %in% selected_assets) %>%
+  arrange(match(symbol, selected_assets)) %>%
+  pull(mean_return)
+names(mu_monthly) <- selected_assets
+
+Sigma_monthly <- returns_est %>%
+  select(all_of(selected_assets)) %>%
+  as.matrix() %>%
+  cov()
+
+mu_annual <- mu_monthly * 12
+Sigma_annual <- Sigma_monthly * 12
+
+portfolio_mean <- function(weights, mu) {
+  sum(weights * mu)
+}
+
+portfolio_variance <- function(weights, Sigma) {
+  as.numeric(t(weights) %*% Sigma %*% weights)
+}
+
+solve_long_only_qp <- function(mu, Sigma, objective = c("min_variance", "mean_variance"),
+                               alpha = 0.25, max_weight = 0.40) {
+  objective <- match.arg(objective)
+  n_assets <- length(mu)
+  Sigma_pd <- Sigma + diag(1e-8, n_assets)
+
+  if (objective == "min_variance") {
+    Dmat <- 2 * Sigma_pd
+    dvec <- rep(0, n_assets)
+  } else {
+    Dmat <- 2 * alpha * Sigma_pd
+    dvec <- mu
+  }
+
+  Amat <- cbind(
+    rep(1, n_assets),
+    diag(n_assets),
+    -diag(n_assets)
+  )
+  bvec <- c(1, rep(0, n_assets), rep(-max_weight, n_assets))
+
+  solution <- quadprog::solve.QP(
+    Dmat = Dmat,
+    dvec = dvec,
+    Amat = Amat,
+    bvec = bvec,
+    meq = 1
+  )
+
+  weights <- solution$solution
+  weights[abs(weights) < 1e-8] <- 0
+  names(weights) <- names(mu)
+  weights
+}
+
+john_weights <- solve_long_only_qp(
+  mu = mu_annual,
+  Sigma = Sigma_annual,
+  objective = "min_variance",
+  max_weight = 0.40
+)
+
+mary_alpha <- 0.25
+mary_weights <- solve_long_only_qp(
+  mu = mu_annual,
+  Sigma = Sigma_annual,
+  objective = "mean_variance",
+  alpha = mary_alpha,
+  max_weight = 0.40
+)
+
+blend_john_share <- 0.55
+blend_mary_share <- 0.45
+blended_weights <- blend_john_share * john_weights + blend_mary_share * mary_weights
+
+weight_table <- tibble(
+  Stock = selected_assets,
+  `John conservative portfolio` = as.numeric(john_weights),
+  `Mary growth portfolio` = as.numeric(mary_weights),
+  `Blended portfolio` = as.numeric(blended_weights)
+)
+
+nice_table(
+  weight_table %>%
+    transmute(
+      Stock,
+      `John conservative portfolio` = pct(`John conservative portfolio`, accuracy = 0.1),
+      `Mary growth portfolio` = pct(`Mary growth portfolio`, accuracy = 0.1),
+      `Blended portfolio` = pct(`Blended portfolio`, accuracy = 0.1)
+    ),
+  caption = "Optimal and blended portfolio weights"
+)
+```
+
+```{r portfolio-estimation-summary}
+portfolio_return_series <- function(return_data, weights) {
+  as.numeric(as.matrix(return_data[, names(weights)]) %*% weights)
+}
+
+est_portfolio_returns <- tibble(
+  date = returns_est$date,
+  John = portfolio_return_series(returns_est, john_weights),
+  Mary = portfolio_return_series(returns_est, mary_weights),
+  Blended = portfolio_return_series(returns_est, blended_weights)
+)
+
+summarise_portfolio <- function(returns) {
+  tibble(
+    mean_monthly_return = mean(returns),
+    monthly_volatility = sd(returns),
+    monthly_variance = var(returns),
+    annualised_return = mean(returns) * 12,
+    annualised_volatility = sd(returns) * sqrt(12),
+    sharpe_ratio = mean(returns) / sd(returns)
+  )
+}
+
+est_portfolio_summary <- bind_rows(
+  summarise_portfolio(est_portfolio_returns$John) %>% mutate(Portfolio = "John"),
+  summarise_portfolio(est_portfolio_returns$Mary) %>% mutate(Portfolio = "Mary"),
+  summarise_portfolio(est_portfolio_returns$Blended) %>% mutate(Portfolio = "Blended")
+) %>%
+  select(Portfolio, everything())
+
+nice_table(
+  est_portfolio_summary %>%
+    transmute(
+      Portfolio,
+      `Mean monthly return` = pct(mean_monthly_return),
+      `Monthly volatility` = pct(monthly_volatility),
+      `Monthly variance` = fmt_num(monthly_variance, 5),
+      `Annualised return` = pct(annualised_return),
+      `Annualised volatility` = pct(annualised_volatility),
+      `Sharpe ratio` = round(sharpe_ratio, 3)
+    ),
+  caption = "Estimated portfolio performance from the first 10 years"
+)
+```
+
+The blended portfolio uses 55% of John's conservative portfolio and 45% of Mary's growth-oriented portfolio. This gives slightly more weight to capital preservation because the clients are recently retired, while still giving substantial importance to Mary's preference for long-term growth. 
+
+# 4. Out-of-Sample Validation and Comparative Analysis
+
+## 4.1 Out-of-Sample Validation
+
+The validation test uses only the 2025 monthly returns. This year was not used to estimate expected returns, variances, correlations, or optimal weights.
+
+```{r validation-performance}
+val_portfolio_returns <- tibble(
+  date = returns_val$date,
+  John = portfolio_return_series(returns_val, john_weights),
+  Mary = portfolio_return_series(returns_val, mary_weights),
+  Blended = portfolio_return_series(returns_val, blended_weights)
+)
+
+val_portfolio_summary <- bind_rows(
+  summarise_portfolio(val_portfolio_returns$John) %>% mutate(Portfolio = "John"),
+  summarise_portfolio(val_portfolio_returns$Mary) %>% mutate(Portfolio = "Mary"),
+  summarise_portfolio(val_portfolio_returns$Blended) %>% mutate(Portfolio = "Blended")
+) %>%
+  select(Portfolio, everything())
+
+portfolio_comparison <- bind_rows(
+  est_portfolio_summary %>% mutate(Period = "Estimation: 2015-2024"),
+  val_portfolio_summary %>% mutate(Period = "Validation: 2025")
+) %>%
+  select(Period, Portfolio, everything())
+
+nice_table(
+  portfolio_comparison %>%
+    transmute(
+      Period,
+      Portfolio,
+      `Mean monthly return` = pct(mean_monthly_return),
+      `Monthly volatility` = pct(monthly_volatility),
+      `Annualised return` = pct(annualised_return),
+      `Annualised volatility` = pct(annualised_volatility),
+      `Sharpe ratio` = round(sharpe_ratio, 3)
+    ),
+  caption = "Estimation versus out-of-sample validation performance"
+)
+```
+
+```{r validation-plot, fig.cap="Out-of-sample cumulative value of one dollar invested in each portfolio during 2025"}
+val_growth <- val_portfolio_returns %>%
+  mutate(across(-date, ~ cumprod(1 + .x))) %>%
+  pivot_longer(-date, names_to = "Portfolio", values_to = "Growth")
+
+ggplot(val_growth, aes(x = date, y = Growth, color = Portfolio)) +
+  geom_line(linewidth = 0.9) +
+  labs(
+    title = "Out-of-sample cumulative growth",
+    subtitle = validation_label,
+    x = "Date",
+    y = "Value of $1 invested"
+  ) +
+  theme_minimal()
+```
+
+## 4.2 Objective Evaluation
+
+```{r objective-checks}
+john_val <- val_portfolio_summary %>% filter(Portfolio == "John")
+mary_val <- val_portfolio_summary %>% filter(Portfolio == "Mary")
+blend_val <- val_portfolio_summary %>% filter(Portfolio == "Blended")
+
+john_lower_vol <- john_val$monthly_volatility < mary_val$monthly_volatility
+mary_higher_return <- mary_val$mean_monthly_return > john_val$mean_monthly_return
+```
+
+In the validation year, John's monthly volatility was `r pct(john_val$monthly_volatility)`, while Mary's was `r pct(mary_val$monthly_volatility)`. Therefore, John's lower-volatility objective was `r ifelse(john_lower_vol, "met", "not met")` out of sample. Mary's average monthly return was `r pct(mary_val$mean_monthly_return)`, while John's was `r pct(john_val$mean_monthly_return)`. Therefore, Mary's higher-return objective was `r ifelse(mary_higher_return, "met", "not met")` out of sample. However, Mary's higher return came with higher volatility, which shows the expected trade-off between growth and risk. The blended portfolio sits between the two client-specific portfolios, with monthly volatility of `r pct(blend_val$monthly_volatility)` and average monthly return of `r pct(blend_val$mean_monthly_return)`.
+
+## 4.3 Statistical Tests for Changed Expected Returns
+
+For each portfolio, the test compares the 2025 validation mean return with the mean return estimated from 2015-2024.
+
+The hypotheses are:
+
+\[
+H_0: \mu_{2025} = \mu_{2015-2024}
+\]
+
+\[
+H_A: \mu_{2025} \neq \mu_{2015-2024}.
+\]
+
+A two-sided one-sample t-test is used for each 2025 portfolio return series, with the null value set equal to the corresponding estimated mean from the first 10 years. The significance level is 5%.
+
+```{r statistical-tests}
+test_portfolio_change <- function(portfolio_name) {
+  estimation_returns <- est_portfolio_returns[[portfolio_name]]
+  validation_returns <- val_portfolio_returns[[portfolio_name]]
+  test_result <- t.test(validation_returns, mu = mean(estimation_returns))
+
+  tibble(
+    Portfolio = portfolio_name,
+    `Estimation mean` = mean(estimation_returns),
+    `Validation mean` = mean(validation_returns),
+    `t statistic` = unname(test_result$statistic),
+    `p-value` = test_result$p.value,
+    Decision = if_else(test_result$p.value < 0.05, "Reject H0", "Do not reject H0")
+  )
+}
+
+test_results <- bind_rows(
+  test_portfolio_change("John"),
+  test_portfolio_change("Mary"),
+  test_portfolio_change("Blended")
+)
+
+nice_table(
+  test_results %>%
+    transmute(
+      Portfolio,
+      `Estimation mean` = pct(`Estimation mean`),
+      `Validation mean` = pct(`Validation mean`),
+      `t statistic` = round(`t statistic`, 3),
+      `p-value` = round(`p-value`, 4),
+      Decision
+    ),
+  caption = "Two-sided t-tests for whether expected portfolio returns changed in 2025"
+)
+```
+
+The tests should be interpreted cautiously because the validation period contains only 12 monthly observations. A non-rejection of \(H_0\) does not prove that expected returns are unchanged. It only means that the 2025 data does not provide strong enough evidence to conclude that expected returns changed at the 5% significance level. In other words, the 2025 average returns are lower, but the difference may be due to normal monthly return variation rather than a true change in expected return. 
+
+# 5. Recommendation and Reflection
+
+## 5.1 Proposed Blended Portfolio
+
+The recommended practical compromise is the blended portfolio, using 55% of John's conservative portfolio and 45% of Mary's growth portfolio. The 55/45 split gives slightly greater weight to capital preservation because John and Mary are recently retired, but it still preserves a meaningful growth allocation for Mary's objective. For the $1.5 million portfolio, the recommended dollar allocation is shown below.
+
+```{r blended-recommendation}
+nice_table(
+  weight_table %>%
+    select(Stock, `Blended portfolio`) %>%
+    mutate(
+      rounded_weight = round(`Blended portfolio` * 100, 1),
+      dollar_allocation = rounded_weight / 100 * client_portfolio_value
+    ) %>%
+    transmute(
+      Stock,
+      `Blended portfolio weight` = paste0(format(rounded_weight, nsmall = 1), "%"),
+      `Dollar allocation` = fmt_dollar(dollar_allocation)
+    ),
+  caption = "Recommended blended portfolio allocation for the $1.5 million portfolio"
+)
+```
+
+The validation evidence supports the 55/45 blend. Compared with John's portfolio, the blended portfolio increased average monthly return by 0.11 percentage points while increasing monthly volatility by 0.53 percentage points. Compared with Mary's portfolio, the blend reduced monthly volatility by 1.51 percentage points while giving up 0.12 percentage points in average monthly return. This is a reasonable compromise for recently retired clients because it improves realised return relative to the conservative option without adopting the full volatility of the growth portfolio.
+
+## 5.2 Methodological Reflection
+
+This analysis shows that an "optimal" portfolio from a model should not be treated as a perfect answer. The weights depend on the data period, the objective function, and the constraints used in the model. Small changes to these choices can lead to different portfolio allocations. Furthermore, expected returns are difficult to estimate accurately because monthly stock returns fluctuate a lot. Therefore, the optimisation results should be used as guidance, not as a guaranteed prediction of future performance. 
+
+The main judgement call was how to convert John and Mary's different preferences into portfolio rules. John's preference for capital preservation was represented by a lower-risk objective, while Mary's preference for growth was represented by a return-focused objective. I also used a 40% maximum weight for each stock to avoid putting too much money into one company. Finally, I chose a 55/45 blended portfolio because the clients are recently retired, so capital preservation should receive slightly more weight, while Mary's growth preference should still be meaningfully included.
+
+AI assistance was used as a drafting and coding aid. The output was validated by checking the analytical requirements, using the predefined ticker set, applying the 10-year estimation and 1-year validation split, checking the formulas for returns, confidence intervals, covariance, and portfolio objectives, and knitting the R Markdown file to confirm that the analysis is reproducible on Posit Cloud.
+
